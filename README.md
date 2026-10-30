@@ -1,5 +1,7 @@
 # PayNet WebApp
 
+> **New: UM Connect+ PWA on Firebase** lives in `app/`. Students, merchants and MPP use real accounts and a shared Firestore database, and students and merchants can install it as an app. See **[DEPLOY.md](DEPLOY.md)** to run it locally (`npm install && npm run dev`) or deploy it to Firebase Hosting. The files below describe the original browser-only demonstrator, which is unchanged.
+
 UM Connect+ is an interactive campus cashless-commerce UI prototype for Universiti Malaya students, merchants and MPP.
 
 ## Run

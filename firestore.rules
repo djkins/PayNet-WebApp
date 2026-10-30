@@ -1,0 +1,376 @@
+rules_version = '2';
+
+// UM Connect+ security rules (Spark plan, no Cloud Functions).
+// Every points change is paired with an immutable ledger entry in the same batch,
+// and each ledger type can only be written by the role allowed to earn it.
+// Run `npm run setup` to replace the admin email below before deploying.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- identity ----------
+    function bootstrapAdmins() { return ['admin@umconnect-e455a.web.app']; }
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function email() { return request.auth.token.email; }
+    function verified() { return signedIn() && request.auth.token.email_verified == true; }
+    function docPath(p) { return /databases/$(database)/documents/$(p); }
+    function access() { return get(/databases/$(database)/documents/config/access).data; }
+    // Bootstrap admins are created by the project owner in the Firebase console, so they don't need email
+    // verification. Reviewers added later in the app must verify their email first.
+    function isMpp() {
+      return signedIn() && (email() in bootstrapAdmins() || (verified() && email() in access().mppEmails));
+    }
+    function cfg() { return get(/databases/$(database)/documents/config/rules).data; }
+    function userDoc(u) { return get(/databases/$(database)/documents/users/$(u)).data; }
+    function userAfter(u) { return getAfter(/databases/$(database)/documents/users/$(u)).data; }
+    function isStudent() { return verified() && userDoc(uid()).role == 'student'; }
+    function isMerchantRole() { return verified() && userDoc(uid()).role == 'merchant'; }
+    function isVerifiedMerchant() {
+      return isMerchantRole() && get(/databases/$(database)/documents/merchants/$(uid())).data.status == 'verified';
+    }
+    function studentEmailAllowed() {
+      return email().split('@')[1] in access().studentDomains || email() in access().testerEmails;
+    }
+
+    // ---------- time (Malaysia, UTC+8) ----------
+    function myt(t) { return t + duration.value(8, 'h'); }
+    function pad(n) { return n < 10 ? '0' + string(n) : string(n); }
+    function dayKey(t) { return string(myt(t).year()) + '-' + pad(myt(t).month()) + '-' + pad(myt(t).day()); }
+    function monthKey(t) { return string(myt(t).year()) + '-' + pad(myt(t).month()); }
+    function minuteOfDay(t) { return myt(t).hours() * 60 + myt(t).minutes(); }
+
+    // ---------- shorthands ----------
+    function D() { return request.resource.data; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // ---------- config ----------
+    match /config/{name} {
+      allow read: if signedIn() && ((name == 'rules' || name == 'budget') || isMpp());
+      allow write: if isMpp();
+    }
+
+    // ---------- users ----------
+    match /users/{u} {
+      function ptsChanged() { return changed().hasAny(['points', 'lastTx']); }
+      function ledgerAfter() {
+        return getAfter(/databases/$(database)/documents/users/$(u)/ledger/$(D().lastTx)).data;
+      }
+      function validPoints() {
+        return !ptsChanged() || (
+          D().points is int && D().points >= 0
+          && D().lastTx != resource.data.lastTx
+          && !exists(/databases/$(database)/documents/users/$(u)/ledger/$(D().lastTx))
+          && ledgerAfter().delta == D().points - resource.data.points
+        );
+      }
+      function validInviter() {
+        return !('inviterUid' in resource.data) && !('firstTx' in resource.data)
+          && D().inviterUid != u
+          && get(/databases/$(database)/documents/referralCodes/$(D().inviterCode)).data.uid == D().inviterUid
+          && existsAfter(/databases/$(database)/documents/referrals/$(u));
+      }
+      function validFirstTx() {
+        return !('firstTx' in resource.data)
+          && get(/databases/$(database)/documents/txRequests/$(D().firstTx)).data.studentUid == u
+          && get(/databases/$(database)/documents/txRequests/$(D().firstTx)).data.status == 'confirmed';
+      }
+      function validRefCounter() {
+        return D().refMonth == monthKey(request.time)
+          && D().refCount <= cfg().referralCap
+          && (('refMonth' in resource.data && resource.data.refMonth == D().refMonth)
+                ? D().refCount == resource.data.refCount + 1
+                : D().refCount == 1)
+          && ptsChanged() && ledgerAfter().type == 'inviter';
+      }
+      function selfUpdate() {
+        return changed().hasOnly(['name', 'college', 'faculty', 'goalCents', 'points', 'lastTx',
+                                  'inviterUid', 'inviterCode', 'firstTx', 'refMonth', 'refCount'])
+          && (!changed().hasAny(['inviterUid', 'inviterCode']) || validInviter())
+          && (!changed().hasAny(['firstTx']) || validFirstTx())
+          && (!changed().hasAny(['refMonth', 'refCount']) || validRefCounter())
+          && (!changed().hasAny(['college']) || D().college is string);
+      }
+
+      allow read: if signedIn() && (uid() == u || isMpp());
+      allow create: if verified() && uid() == u
+        && D().keys().hasOnly(['role', 'name', 'email', 'matric', 'college', 'faculty', 'points', 'lastTx',
+                               'referralCode', 'goalCents', 'createdAt'])
+        && D().points == 0 && D().lastTx == '' && D().email == email()
+        && D().createdAt == request.time && D().name is string && D().name.size() > 1
+        && (D().role == 'merchant' || (D().role == 'student' && studentEmailAllowed()
+            && D().matric is string && D().matric.matches('^[A-Z0-9]{5,15}$')
+            && getAfter(/databases/$(database)/documents/matrics/$(D().matric)).data.uid == u));
+      allow update: if signedIn() && validPoints() && (
+          (uid() == u && selfUpdate())
+          || (isVerifiedMerchant() && changed().hasOnly(['points', 'lastTx']) && ptsChanged()
+              && ledgerAfter().type == 'purchase')
+          || (isMpp() && changed().hasOnly(['points', 'lastTx', 'disabled'])
+              && (!ptsChanged() || ledgerAfter().type == 'adjust'))
+        );
+
+      // ---------- points ledger (immutable) ----------
+      match /ledger/{id} {
+        function L() { return request.resource.data; }
+        function txAfter() { return getAfter(/databases/$(database)/documents/txRequests/$(id)).data; }
+        function purchaseOk() {
+          return isVerifiedMerchant()
+            && get(/databases/$(database)/documents/txRequests/$(id)).data.status == 'pending'
+            && txAfter().status == 'confirmed' && txAfter().merchantId == uid()
+            && txAfter().studentUid == u && L().delta == txAfter().points;
+        }
+        function offpeakOk() {
+          let t = get(/databases/$(database)/documents/txRequests/$(L().tx)).data;
+          let d = get(/databases/$(database)/documents/deals/$(L().deal)).data;
+          let k = L().deal + '_' + dayKey(t.confirmedAt);
+          let kp = /databases/$(database)/documents/dealDays/$(k);
+          return t.status == 'confirmed' && t.studentUid == u && t.dealId == L().deal
+            && d.status == 'approved' && d.enabled == true && d.merchantId == t.merchantId
+            && t.cents >= d.minSpendCents
+            && minuteOfDay(t.confirmedAt) >= d.startMin && minuteOfDay(t.confirmedAt) < d.endMin
+            && id == 'offpeak_' + k && L().delta == d.bonus
+            && getAfter(kp).data.count <= d.limit
+            && getAfter(kp).data.count == (exists(kp) ? get(kp).data.count + 1 : 1);
+        }
+        function redeemOk() {
+          let v = getAfter(/databases/$(database)/documents/vouchers/$(id)).data;
+          return !exists(/databases/$(database)/documents/vouchers/$(id))
+            && v.studentUid == u && L().delta == 0 - v.cost;
+        }
+        function donateOk() {
+          let w = getAfter(/databases/$(database)/documents/stats/welfare).data;
+          return L().delta < 0 && w.lastUid == u && w.lastId == id
+            && w.points == get(/databases/$(database)/documents/stats/welfare).data.points - L().delta;
+        }
+        function refCounted() {
+          return userAfter(u).refMonth == monthKey(request.time)
+            && (userDoc(u).get('refMonth', '') == monthKey(request.time)
+                ? userAfter(u).refCount == userDoc(u).get('refCount', 0) + 1
+                : userAfter(u).refCount == 1);
+        }
+        function validEntry() {
+          return (L().type == 'purchase' && purchaseOk())
+            || (uid() == u && isStudent() && (
+                 (L().type == 'survey' && id == 'survey' && L().delta == cfg().surveyBonus)
+              || (L().type == 'lesson' && id in ['lesson0', 'lesson1', 'lesson2']
+                  && L().answer == get(/databases/$(database)/documents/config/lessonKeys).data[id]
+                  && L().delta == cfg().lessonBonus)
+              || (L().type == 'friend' && id == 'referral_friend' && 'inviterUid' in userDoc(u)
+                  && 'firstTx' in userDoc(u) && L().delta == cfg().friendBonus)
+              || (L().type == 'inviter' && id == 'ref_' + L().friend
+                  && userDoc(L().friend).inviterUid == u && 'firstTx' in userDoc(L().friend)
+                  && L().delta == cfg().referrerBonus && refCounted())
+              || (L().type == 'offpeak' && offpeakOk())
+              || (L().type == 'redeem' && redeemOk())
+              || (L().type == 'donate' && donateOk())
+            ))
+            || (L().type == 'adjust' && isMpp() && L().note is string && L().note.size() > 2);
+        }
+        allow read: if signedIn() && (uid() == u || isMpp());
+        allow create: if signedIn() && L().by == uid() && L().createdAt == request.time
+          && L().delta is int && L().type is string
+          && userAfter(u).lastTx == id
+          && userAfter(u).points == userDoc(u).points + L().delta
+          && validEntry();
+      }
+    }
+
+    // ---------- one account per matric number ----------
+    match /matrics/{m} {
+      allow get: if signedIn();
+      allow list, delete: if isMpp();
+      allow create: if verified() && D().uid == uid() && D().keys().hasOnly(['uid'])
+        && userAfter(uid()).matric == m;
+    }
+
+    // ---------- referral codes ----------
+    match /referralCodes/{code} {
+      allow read: if signedIn();
+      allow create: if verified() && D().uid == uid() && code.matches('^[A-Z0-9-]{4,24}$')
+        && userAfter(uid()).referralCode == code;
+    }
+
+    match /referrals/{friend} {
+      allow read: if signedIn() && (resource.data.inviterUid == uid() || friend == uid() || isMpp());
+      allow create: if verified() && friend == uid() && D().qualified == false
+        && D().inviterUid == userAfter(uid()).inviterUid && D().createdAt == request.time
+        && D().keys().hasOnly(['inviterUid', 'friendName', 'createdAt', 'qualified']);
+      allow update: if verified() && friend == uid() && changed().hasOnly(['qualified'])
+        && D().qualified == true && 'firstTx' in userDoc(uid());
+    }
+
+    // ---------- merchants ----------
+    match /merchants/{m} {
+      function profileKeys() {
+        return ['name', 'type', 'segment', 'location', 'zone', 'eventName', 'eventEnd'];
+      }
+      allow read: if signedIn() && (resource.data.status == 'verified' || m == uid() || isMpp());
+      allow create: if isMerchantRole() && m == uid() && D().ownerUid == uid() && D().status == 'pending'
+        && D().submittedAt == request.time && D().name is string && D().name.size() > 1
+        && D().keys().hasOnly(['ownerUid', 'status', 'submittedAt', 'name', 'type', 'segment', 'location',
+                               'zone', 'eventName', 'eventEnd', 'seats', 'occupied', 'ready']);
+      allow update: if signedIn() && (
+          (m == uid() && resource.data.status != 'verified'
+             && changed().hasOnly(['name', 'type', 'segment', 'location', 'zone', 'eventName', 'eventEnd',
+                                   'status', 'submittedAt', 'seats', 'occupied', 'occupancyAt', 'ready', 'readyAt'])
+             && D().status == 'pending' && (!changed().hasAny(['submittedAt']) || D().submittedAt == request.time))
+          || (m == uid() && resource.data.status == 'verified'
+             && changed().hasOnly(['seats', 'occupied', 'occupancyAt', 'ready', 'readyAt'])
+             && (!changed().hasAny(['occupied', 'seats']) || (D().occupied is int && D().seats is int
+                 && D().occupied >= 0 && D().occupied <= D().seats)))
+          || (isMpp() && changed().hasOnly(['status', 'reviewNote', 'reviewedBy', 'reviewedAt', 'offer'])
+             && D().status in ['pending', 'verified', 'rejected', 'suspended'])
+        );
+    }
+
+    match /merchantPrivate/{m} {
+      allow read: if signedIn() && (m == uid() || isMpp());
+      allow create, update: if isMerchantRole() && m == uid()
+        && getAfter(/databases/$(database)/documents/merchants/$(m)).data.status != 'verified'
+        && D().keys().hasOnly(['accountName', 'phone', 'ambassadorId', 'qrImage', 'qrUpdatedAt'])
+        && (!('qrImage' in D()) || (D().qrImage is string && D().qrImage.size() < 700000));
+    }
+
+    // ---------- offers and off-peak deals ----------
+    match /offers/{id} {
+      allow read: if signedIn() && (resource.data.status == 'approved' || resource.data.merchantId == uid() || isMpp());
+      allow create: if isMerchantRole() && D().merchantId == uid() && D().status == 'pending'
+        && D().createdAt == request.time && D().title is string && D().title.size() > 2;
+      allow update: if isMpp() && changed().hasOnly(['status', 'reviewedBy', 'reviewedAt'])
+        || (signedIn() && resource.data.merchantId == uid() && changed().hasOnly(['status']) && D().status == 'withdrawn');
+    }
+
+    match /deals/{id} {
+      allow read: if signedIn() && (resource.data.status == 'approved' || resource.data.merchantId == uid() || isMpp());
+      allow create: if isMerchantRole() && D().merchantId == uid() && D().status == 'pending'
+        && D().enabled == true && D().bonus is int && D().bonus > 0 && D().bonus <= 500
+        && D().limit is int && D().limit > 0 && D().minSpendCents is int
+        && D().startMin is int && D().endMin is int && D().startMin < D().endMin
+        && D().threshold is int && D().threshold > 0 && D().threshold <= 100;
+      allow update: if (signedIn() && resource.data.merchantId == uid() && changed().hasOnly(['enabled']))
+        || (isMpp() && changed().hasOnly(['status', 'reviewedBy', 'reviewedAt']));
+    }
+
+    match /dealDays/{k} {
+      allow read: if signedIn();
+      allow create: if verified() && D().count == 1
+        && existsAfter(/databases/$(database)/documents/users/$(uid())/ledger/$('offpeak_' + k));
+      allow update: if verified() && D().count == resource.data.count + 1
+        && existsAfter(/databases/$(database)/documents/users/$(uid())/ledger/$('offpeak_' + k));
+    }
+
+    // ---------- transactions: student requests, merchant confirms ----------
+    match /txRequests/{id} {
+      function dealEligible() {
+        let d = get(/databases/$(database)/documents/deals/$(D().dealId)).data;
+        let m = get(/databases/$(database)/documents/merchants/$(D().merchantId)).data;
+        return d.status == 'approved' && d.enabled == true && d.merchantId == D().merchantId
+          && m.occupied * 100 < d.threshold * m.seats;
+      }
+      allow read: if signedIn() && (resource.data.studentUid == uid() || resource.data.merchantId == uid() || isMpp());
+      allow create: if isStudent() && D().studentUid == uid() && D().status == 'pending'
+        && D().createdAt == request.time
+        && D().keys().hasOnly(['studentUid', 'studentName', 'studentCollege', 'merchantId', 'merchantName',
+                               'cents', 'status', 'createdAt', 'dealId'])
+        && D().cents is int && D().cents >= 50 && D().cents <= cfg().maxTxCents
+        && D().studentName == userDoc(uid()).name && D().studentCollege == userDoc(uid()).college
+        && get(/databases/$(database)/documents/merchants/$(D().merchantId)).data.status == 'verified'
+        && (!('dealId' in D()) || dealEligible());
+      allow update: if signedIn() && (
+          (resource.data.studentUid == uid() && resource.data.status == 'pending'
+             && changed().hasOnly(['status']) && D().status == 'cancelled')
+          || (isVerifiedMerchant() && resource.data.merchantId == uid() && resource.data.status == 'pending'
+             && request.time < resource.data.createdAt + duration.value(cfg().txTtlMin, 'm')
+             && changed().hasOnly(['status', 'confirmedAt', 'confirmedBy', 'points', 'confirmDay',
+                                   'confirmMonth'])
+             && D().status == 'confirmed' && D().confirmedAt == request.time && D().confirmedBy == uid()
+             && D().points is int
+             && D().points * 100 <= resource.data.cents * cfg().baseRate
+             && (D().points + 1) * 100 > resource.data.cents * cfg().baseRate
+             && D().confirmMonth is string && D().confirmDay is string
+             && existsAfter(/databases/$(database)/documents/users/$(resource.data.studentUid)/ledger/$(id))
+             && getAfter(/databases/$(database)/documents/stats/campus).data.lastTx == id)
+          || (isMpp() && changed().hasOnly(['flag', 'flagNote', 'flaggedBy']))
+        );
+    }
+
+    // ---------- campus stats (leaderboard and welfare pool) ----------
+    match /stats/campus {
+      allow read: if signedIn();
+      allow create: if isMpp();
+      allow update: if isMpp() || (isVerifiedMerchant() && campusIncrementOk());
+      function campusIncrementOk() {
+        let t = getAfter(/databases/$(database)/documents/txRequests/$(D().lastTx)).data;
+        return changed().hasOnly(['checkins', 'cents', 'colleges', 'lastTx'])
+          && get(/databases/$(database)/documents/txRequests/$(D().lastTx)).data.status == 'pending'
+          && t.status == 'confirmed' && t.merchantId == uid()
+          && D().checkins == resource.data.checkins + 1
+          && D().cents == resource.data.cents + t.cents
+          && D().colleges.diff(resource.data.colleges).affectedKeys().hasOnly([t.studentCollege])
+          && D().colleges[t.studentCollege] == resource.data.colleges.get(t.studentCollege, 0) + 1;
+      }
+    }
+    match /stats/welfare {
+      allow read: if signedIn();
+      allow create: if isMpp();
+      allow update: if isMpp() || (isStudent() && changed().hasOnly(['points', 'lastUid', 'lastId'])
+        && D().lastUid == uid()
+        && !exists(/databases/$(database)/documents/users/$(uid())/ledger/$(D().lastId))
+        && getAfter(/databases/$(database)/documents/users/$(uid())/ledger/$(D().lastId)).data.type == 'donate'
+        && D().points == resource.data.points
+             - getAfter(/databases/$(database)/documents/users/$(uid())/ledger/$(D().lastId)).data.delta);
+    }
+
+    // ---------- rewards and vouchers ----------
+    match /rewards/{r} {
+      allow read: if signedIn();
+      allow write: if isMpp();
+      allow update: if isStudent() && changed().hasOnly(['issued', 'lastVoucher'])
+        && D().issued == resource.data.issued + 1 && D().issued <= resource.data.stock
+        && !exists(/databases/$(database)/documents/vouchers/$(D().lastVoucher))
+        && existsAfter(/databases/$(database)/documents/vouchers/$(D().lastVoucher));
+    }
+
+    match /vouchers/{v} {
+      function reward() { return get(/databases/$(database)/documents/rewards/$(D().rewardId)).data; }
+      allow read: if signedIn() && (resource.data.studentUid == uid() || resource.data.merchantId == uid() || isMpp());
+      allow create: if isStudent() && D().studentUid == uid() && D().status == 'issued'
+        && D().createdAt == request.time && reward().active == true
+        && D().cost == reward().cost && D().valueCents == reward().valueCents
+        && D().merchantId == reward().merchantId && D().title == reward().title
+        && getAfter(/databases/$(database)/documents/rewards/$(D().rewardId)).data.lastVoucher == v
+        && existsAfter(/databases/$(database)/documents/users/$(uid())/ledger/$(v));
+      allow update: if signedIn() && resource.data.status == 'issued'
+        && changed().hasOnly(['status', 'usedAt', 'usedBy']) && D().status == 'used'
+        && D().usedAt == request.time && D().usedBy == uid()
+        && ((resource.data.merchantId == uid() && isVerifiedMerchant()) || isMpp());
+    }
+
+    // ---------- surveys, missions ----------
+    match /surveys/{u} {
+      allow read: if signedIn() && (uid() == u || isMpp());
+      allow write: if verified() && uid() == u
+        && D().keys().hasOnly(['role', 'answers', 'knowledge', 'digital', 'score', 'grade', 'at'])
+        && D().knowledge is int && D().digital is int && D().at == request.time;
+    }
+
+    match /missionClaims/{id} {
+      allow read: if signedIn() && (resource.data.uid == uid() || isMpp());
+      allow create: if isStudent() && D().uid == uid() && D().status == 'pending'
+        && id == uid() + '_' + D().week + '_' + D().mission && D().createdAt == request.time;
+      allow update: if isMpp() && changed().hasOnly(['status', 'reviewedBy', 'reviewedAt']);
+    }
+
+    // ---------- MPP-only programme records ----------
+    match /campaigns/{id} {
+      allow read: if signedIn();
+      allow write: if isMpp();
+    }
+    match /manualVolumes/{id} {
+      allow read, write: if isMpp();
+    }
+    match /paynetCounts/{id} {
+      allow read, write: if isMpp();
+    }
+  }
+}

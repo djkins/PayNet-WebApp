@@ -1,0 +1,30 @@
+{
+  "name": "um-connect-plus",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "dev": "node scripts/serve.mjs app",
+    "test": "node tests/local.mjs",
+    "test:e2e": "node tests/e2e.mjs",
+    "test:emulator": "firebase emulators:exec --only firestore \"node tests/emulator.mjs\"",
+    "setup": "node scripts/setup.mjs",
+    "build": "node scripts/build.mjs",
+    "deploy": "npm test && firebase deploy --only firestore,hosting",
+    "vendor:firebase": "esbuild scripts/firebase-entry.js --bundle --format=esm --minify --target=es2020 --outfile=app/vendor/firebase.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^6.0.0",
+    "esbuild": "^0.28.2",
+    "firebase": "^13.1.0",
+    "firebase-tools": "^15.34.2",
+    "playwright": "^1.56.0"
+  },
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  }
+}
