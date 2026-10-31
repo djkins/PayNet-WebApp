@@ -20,7 +20,13 @@ export async function initBackend() {
     return { sdk, mode: 'demo', auth: sdk.getAuth(app), db: sdk.getFirestore(app) };
   }
   const sdk = await import('../vendor/firebase.js');
-  const app = sdk.initializeApp(firebaseConfig);
+  // Run Google sign-in on the same domain as the app. Chrome blocks the popup handshake when the
+  // auth domain (firebaseapp.com) differs from the site (web.app). Firebase Hosting serves
+  // /__/auth/handler on both domains, so this works without extra hosting setup.
+  const cfg = { ...firebaseConfig };
+  const host = location.hostname;
+  if (cfg.projectId && (host === `${cfg.projectId}.web.app` || host === `${cfg.projectId}.firebaseapp.com`)) cfg.authDomain = host;
+  const app = sdk.initializeApp(cfg);
   let db;
   try {
     db = sdk.initializeFirestore(app, { localCache: sdk.persistentLocalCache({ tabManager: sdk.persistentMultipleTabManager() }) });
